@@ -2,15 +2,21 @@
 #include <cstdint>
 #include <cstdlib>
 
+#include <string>
 #include <algorithm>
+#include <vector>
 
 enum USSEOpcodeType : int {
+    // vecmov ops (lower 6 bits are reserved for move data type flags on USSEInstruction)
     OP_VMOV,
     OP_VMOVC,
     OP_VMOVCU8,
-    OP_VF16MAD,
-    OP_VMAD,
 
+    // vecmad ops
+    OP_VF16MAD,
+    OP_V4MAD,
+
+    // pck ops
     OP_VPCKU8U8,
     OP_VPCKU8S8,
     OP_VPCKU8O8,
@@ -65,8 +71,31 @@ enum USSEOpcodeType : int {
     OP_VPCKC10F16,
     OP_VPCKC10F32,
     OP_VPCKC10C10,
-    
+
+    // moectrl ops
+    OP_SMOA,
+    OP_SMR,
+    OP_SMLSI,
+    OP_SMBO,
+    OP_IMO,
+    OP_SETFC,
+
+    // single issue ops
+    OP_VDP3,
+    OP_VDP4,
+    OP_VMAD3,
+    OP_VMAD4,
+
     OP_UNDEF,
+};
+
+enum USSEMoveTypeFlags : uint32_t {
+    MOVE_TYPE_INT8 = (1 << 0),
+    MOVE_TYPE_INT16 = (1 << 1),
+    MOVE_TYPE_INT32 = (1 << 2),
+    MOVE_TYPE_C10 = (1 << 3),
+    MOVE_TYPE_F16 = (1 << 4),
+    MOVE_TYPE_F32 = (1 << 5)
 };
 
 enum USSERegType : int {
@@ -80,6 +109,7 @@ enum USSERegType : int {
     REGTYPE_FPCONSTANT,
     REGTYPE_IMMEDIATE,
     REGTYPE_INDEX,
+    REGTYPE_INDEXED,
     // both are INDEXED types
     REGTYPE_INDEXED_LOW,
     REGTYPE_INDEXED_HIGH,
@@ -103,11 +133,30 @@ enum USSEIndexReg : int {
     INDEXREG_HIGH
 };
 
+enum USSESourceModifier : int {
+    SOURCE_MODIFIER_NONE,
+    SOURCE_MODIFIER_NEG,
+    SOURCE_MODIFIER_ABS,
+    SOURCE_MODIFIER_NEGABS,
+};
+
+enum IncrementModeType : int {
+    INCREMENT_MODE_US,
+    INCREMENT_MODE_GPI,
+    INCREMENT_MODE_BOTH,
+    INCREMENT_MODE_MOE
+};
+
+const uint32_t source_modifier_table[4] = {
+    SOURCE_MODIFIER_NONE, SOURCE_MODIFIER_NEG,
+    SOURCE_MODIFIER_ABS, SOURCE_MODIFIER_NEGABS
+};
+
 const char *get_register_type_name(const USSERegType& reg) {
     static const char *reg_name[] = {
         "temp", "primattr", "output", "secattr",
         "fpinternal", "special", "global", "fpconstant",
-        "immediate", "index", "indexedlow", "indexedhigh"
+        "immediate", "index", "indexed", "indexedlow", "indexedhigh"
     };
 
     if (reg < 0 || reg >= REGTYPE_UNDEF)
@@ -174,10 +223,34 @@ const char *get_vecmad_source_swizzle(int src_num, int index) {
     return swizzle_table[src_num][index];
 }
 
+struct SGX543Register {
+    USSERegType type;
+    int num;
+    int swizzle_index;
+    int modifier;
+    uint32_t flags;
+};
+
+struct USSEInstruction {
+    USSEOpcodeType op;
+    uint32_t flags;
+    int write_mask;
+    std::vector<SGX543Register> registers;
+    std::string ctrl_disasm;
+};
+
 bool secondary_program_state = false;
 
 int repeat_multiplier[4];
 int repeat_increase[4][17];
+
+void reset_sgx543_register(SGX543Register& reg) {
+    reg.modifier = 0;
+    reg.type = REGTYPE_UNDEF;
+    reg.num = 0;
+    reg.swizzle_index = 0;
+    reg.flags = 0;
+}
 
 void set_repeat_multiplier(const int p0, const int p1, const int p2, const int p3) {
     repeat_multiplier[0] = p0;
@@ -198,9 +271,8 @@ void reset_repeat_increase() {
     }
 }
 
-int get_repeat_offset(const USSERegType& reg_type, uint8_t repeat_index, int dstsrcindex) {
+int get_repeat_offset_moe(uint8_t repeat_index, int dstsrcindex) {
     auto inc = repeat_increase[dstsrcindex][repeat_index];
-
     inc *= repeat_multiplier[dstsrcindex];
     return inc;
 }
@@ -247,8 +319,9 @@ void perform_temp_register_renaming(bool double_registers, USSERegType& reg_bank
     if (reg_bank == REGTYPE_TEMP && _num_value >= (max_reg_num - num_temps_mapped)) {
         reg_bank = REGTYPE_FPINTERNAL;
         _num_value -= (max_reg_num - num_temps_mapped);
-        if (double_registers)
+        if (double_registers) {
             _num_value >>= 1;
+        }
     }
 
     *num = _num_value;
@@ -270,16 +343,15 @@ USSERegType decode_src0_bank(uint32_t upper_instruction, bool allow_extended, in
     return extended_bank ? extended_register_type[bank_nr] : register_type[bank_nr];
 }
 
-void decode_src0_with_num(bool double_registers, uint32_t upper_instruction, bool allow_extended, int *num, int num_field_length, uint32_t uext) {
+USSERegType decode_src0_with_num(bool double_registers, uint32_t upper_instruction, bool allow_extended, int *num, int num_field_length, uint32_t uext) {
     USSERegType reg;
 
     reg = decode_src0_bank(upper_instruction, allow_extended, *num, num_field_length, uext);
     adjust_register_number_units(reg, num, double_registers);
     perform_special_register_renaming(reg, num);
-    perform_temp_register_renaming(true, reg, num, num_field_length, 0);
+    perform_temp_register_renaming(double_registers, reg, num, num_field_length, 0);
     compute_register_final_pass(reg);
-
-    printf("%s%d", get_register_operand_name(reg), *num);
+    return reg;
 }
 
 USSERegType decode_src12_bank(uint32_t upper_instruction, uint32_t lower_instruction, bool allow_extended, int src_num, int num_field_length, uint32_t uext) {
@@ -308,17 +380,16 @@ USSERegType decode_src12_bank(uint32_t upper_instruction, uint32_t lower_instruc
     return extended_bank ? extended_register_type[bank_nr] : register_type[bank_nr];
 }
 
-void decode_src12_with_num(bool double_registers, uint32_t upper_instruction, uint32_t lower_instruction, int src_num, bool allow_extended, int *num, int num_field_length, uint32_t uext) {
+USSERegType decode_src12_with_num(bool double_registers, uint32_t upper_instruction, uint32_t lower_instruction, int src_num, bool allow_extended, int *num, int num_field_length, uint32_t uext) {
     USSERegType reg;
 
     reg = decode_src12_bank(upper_instruction, lower_instruction, true, src_num, num_field_length, uext);
 
     adjust_register_number_units(reg, num, double_registers);
     perform_special_register_renaming(reg, num);
-    perform_temp_register_renaming(true, reg, num, num_field_length, 0);
+    perform_temp_register_renaming(double_registers, reg, num, num_field_length, 0);
     compute_register_final_pass(reg);
-
-    printf("%s%d", get_register_operand_name(reg), *num);
+    return reg;
 }
 
 USSERegType decode_dest_bank(int bank_nr, bool extended_bank) {
@@ -331,7 +402,7 @@ USSERegType decode_dest_bank(int bank_nr, bool extended_bank) {
     return extended_bank ? extended_register_type[bank_nr] : register_type[bank_nr];
 }
 
-void decode_dest_with_num(bool double_registers, uint32_t upper_instruction, bool allow_extended, int *num, int num_field_length) {
+USSERegType decode_dest_with_num(bool double_registers, uint32_t upper_instruction, bool allow_extended, int *num, int num_field_length) {
     int bank_nr;
     bool extended_bank;
     USSERegType reg;
@@ -346,21 +417,89 @@ void decode_dest_with_num(bool double_registers, uint32_t upper_instruction, boo
     reg = decode_dest_bank(bank_nr, extended_bank);
     adjust_register_number_units(reg, num, double_registers);
     perform_special_register_renaming(reg, num);
-    perform_temp_register_renaming(true, reg, num, num_field_length, 0);
+    perform_temp_register_renaming(double_registers, reg, num, num_field_length, 0);
     compute_register_final_pass(reg);
-
-    printf("%s%d", get_register_operand_name(reg), *num);
+    return reg;
 }
-/*
-    src0.index = 0;
-    src1.index = 1;
-    src2.index = 2;
-    dest.index = 3;
-*/
+
+static std::vector<USSEInstruction> usse_instruction_list;
+
+void reset_usse_instruction(USSEInstruction& inst) {
+    inst.op = OP_UNDEF;
+    inst.flags = 0;
+    inst.write_mask = 0;
+    inst.registers.clear();
+    inst.ctrl_disasm = "";
+}
+
+void add_usse_instruction(const USSEInstruction& inst) {
+    usse_instruction_list.push_back(inst);
+}
+
+void clear_usse_instruction_list() {
+    usse_instruction_list.clear();
+}
+
+enum WriteMask : int {
+    WRITE_MASK_X = (1 << 0),
+    WRITE_MASK_Y = (1 << 1),
+    WRITE_MASK_Z = (1 << 2),
+    WRITE_MASK_W = (1 << 3)
+};
+
+uint32_t decode_vec_destination_write_mask(const USSERegType& reg, bool bf32, bool bf16_masks_unrestricted, uint32_t encoded_write_mask) {
+    uint32_t decoded_write_mask;
+    if (reg != REGTYPE_TEMP &&
+        reg != REGTYPE_PRIMATTR &&
+        reg != REGTYPE_OUTPUT &&
+        reg != REGTYPE_SECATTR &&
+        reg != REGTYPE_FPINTERNAL) {
+        bf16_masks_unrestricted = false;
+    }
+
+    if (reg == REGTYPE_FPINTERNAL || (!bf32 && bf16_masks_unrestricted)) {
+        decoded_write_mask = 0;
+        if (encoded_write_mask & 0x1) {
+            decoded_write_mask |= WRITE_MASK_X;
+        }
+        if (encoded_write_mask & 0x2) {
+            decoded_write_mask |= WRITE_MASK_Y;
+        }
+        if (encoded_write_mask & 0x4) {
+            decoded_write_mask |= WRITE_MASK_Z;
+        }
+        if (encoded_write_mask & 0x8) {
+            decoded_write_mask |= WRITE_MASK_W;
+        }
+    } else {
+        if (bf32) {
+            decoded_write_mask = 0;
+            if (encoded_write_mask & 1) {
+                decoded_write_mask |= WRITE_MASK_X;
+            }
+
+            if (encoded_write_mask & 2) {
+                decoded_write_mask |= WRITE_MASK_Y;
+            }
+        } else {
+            decoded_write_mask = 0;
+            if (encoded_write_mask & 1)
+            {
+                decoded_write_mask |= WRITE_MASK_X | WRITE_MASK_Y;
+            }
+            if (encoded_write_mask & 4)
+            {
+                decoded_write_mask |= WRITE_MASK_Z | WRITE_MASK_W;
+            }
+        }
+    }
+    return decoded_write_mask;
+}
 
 int main(int argc, char *argv[]) {
     reset_repeat_increase();
     reset_repeat_multiplier();
+
     uint64_t instructions[] = {
         0x00a2818661004306ull, // vmad
         0x00a2818661405307ull, // vmad
@@ -397,6 +536,7 @@ int main(int argc, char *argv[]) {
 
     secondary_program_state = true;
     int count = 0;
+
     for (auto& instruction : instructions2) {
         int common_opcode;
         
@@ -411,76 +551,115 @@ int main(int argc, char *argv[]) {
         if (++count > 3)
             secondary_program_state = false;
         switch (common_opcode) {
-        case 0: // vecmad/vmad
+        case 0: // vecmad
         {
+            USSEInstruction inst;
+            SGX543Register reg[4];
             bool is_f16 = (upper_part & 0x04000000) == 0x04000000; // vf16mad
-            int dest_num, src0_num, src1_num, src2_num;
+            int dest_num, src0_num, src1_num, src2_num, src0_swizzle, src1_swizzle, src2_swizzle;
+            uint32_t hw_dest_mask;
+            reset_usse_instruction(inst);
+            for (int i = 0; i < 4; i++)
+                reset_sgx543_register(reg[i]);
 
-            printf("vec4mad ");
+            inst.op = is_f16 ? OP_VF16MAD : OP_V4MAD;
+            inst.flags = 0;
+            inst.write_mask = 0;
+
+            // decode dest register
             dest_num = (lower_part & ~0xF03FFFFFU) >> 22;
-            decode_dest_with_num(true, upper_part, true, &dest_num, 7);
+            hw_dest_mask = (upper_part & ~0xFFFFF87FU) >> 7;
 
-            printf(".xyzw, "); // write mask
+            reg[0].type = decode_dest_with_num(true, upper_part, true, &dest_num, 7);
+            reg[0].num = dest_num;
+            reg[0].swizzle_index = 0;
+            reg[0].modifier = SOURCE_MODIFIER_NONE;
+            inst.write_mask = decode_vec_destination_write_mask(reg[0].type, !is_f16, false, hw_dest_mask);
 
+            // decode src0 register
             src0_num = (lower_part & ~0xFFFC0FFFU) >> 12;
-            decode_src0_with_num(true, upper_part, false, &src0_num, 7, 0);
+            src0_swizzle = ((lower_part & ~0xFFF3FFFFU) >> 18) | ((upper_part & ~0xFFDFFFFFU) >> 21) << 2;
+            reg[1].type = decode_src0_with_num(true, upper_part, false, &src0_num, 7, 0);
+            reg[1].num = src0_num;
 
-            if (upper_part & 0x40000) {
-                printf("%s", get_source_modifier_name(2));
-            }
+            if ((upper_part & 0x40000) != 0)
+                reg[1].modifier = SOURCE_MODIFIER_ABS;
 
-            int src0_swizzle = ((lower_part & ~0xFFF3FFFFU) >> 18) | ((upper_part & ~0xFFDFFFFFU) >> 21) << 2;
-            printf(".%s", get_vecmad_source_swizzle(0, src0_swizzle));
-            printf(", ");
+            reg[1].swizzle_index = src0_swizzle;
 
+            // decode src1 register
             src1_num = (lower_part & ~0xFFFFF03FU) >> 6;
-            decode_src12_with_num(true, upper_part, lower_part, 1, true, &src1_num, 7, 0x00020000);
-
-            int src1_swizzle = ((lower_part & ~0xFFCFFFFFU) >> 20) | ((upper_part & ~0xFFFFEFFFU) >> 12) << 2;
-            printf(".%s", get_vecmad_source_swizzle(1, src1_swizzle));
-            printf(", ");
+            src1_swizzle = ((lower_part & ~0xFFCFFFFFU) >> 20) | ((upper_part & ~0xFFFFEFFFU) >> 12) << 2;
+            reg[2].type = decode_src12_with_num(true, upper_part, lower_part, 1, true, &src1_num, 7, 0x00020000);
+            reg[2].num = src1_num;
+            reg[2].modifier = source_modifier_table[(upper_part & ~0xFFFFFF9FU) >> 5];
+            reg[2].swizzle_index = src1_swizzle;
 
             src2_num = (lower_part & ~0xFFFFFFC0U);
-            decode_src12_with_num(true, upper_part, lower_part, 2, true, &src2_num, 7, 0x00010000);
+            src2_swizzle = ((upper_part & ~0xFFFF1FFFU) >> 13);
+            reg[3].type = decode_src12_with_num(true, upper_part, lower_part, 2, true, &src2_num, 7, 0x00010000);
+            reg[3].num = src2_num;
+            reg[3].modifier = source_modifier_table[(upper_part & ~0xFFFFFFE7U) >> 3];
+            reg[3].swizzle_index = src2_swizzle;
 
-            int src2_swizzle = ((upper_part & ~0xFFFF1FFFU) >> 13);
-            printf(".%s", get_vecmad_source_swizzle(2, src2_swizzle));
-
-            printf(" // (two writes of components (xy) apply here based on instructions)\n");
-            //bad_opcode = true;
+            for (int i = 0; i < 4; i++)
+                inst.registers.push_back(reg[i]);
+            usse_instruction_list.push_back(inst);
             break;
         }
         case 3: // svec
         {
+            USSEInstruction inst;
+            SGX543Register reg[4];
+            int write_mask;
+            int dest_num, src0_num, src1_num, src2_num;
+            int increment_mode = (upper_part & ~0xFFFE7FFFU) >> 15;
+            int repeat_count;
+
+            USSEOpcodeType ops[] = {
+                OP_VDP3,
+                OP_VDP4,
+                OP_VMAD3,
+                OP_VMAD4
+            };
+
+            USSEOpcodeType op = ops[(upper_part & ~0xFFCFFFFFU) >> 20];
+            reset_usse_instruction(inst);
+            for (int i = 0; i < 4; i++)
+                reset_sgx543_register(reg[i]);
+
+            write_mask = (upper_part & ~0xFFFFF87FU) >> 7;
+
+            inst.op = op;
+            inst.write_mask = write_mask;
             bad_opcode = true;
             break;
         }
         case 7: // vecmov
         {
+            USSEInstruction inst;
+            SGX543Register reg[4];
+
+            static const USSEOpcodeType move_op_table[] = { OP_VMOV, OP_VMOVC, OP_VMOVCU8, OP_UNDEF };
+            int hw_write_mask;
             int move_type = (upper_part & ~0xFFFF3FFFU) >> 14;
             int data_type;
             bool double_registers;
             int number_field_length;
             int repeat_count;
+            int current_arg = 0;
+
+            reset_usse_instruction(inst);
+
+            inst.op = move_op_table[move_type];
 
             data_type = (upper_part & ~0xFFFFF8FFU) >> 8;
-            switch (data_type) {
-            case DATA_TYPE_INT8:
-                break;
-            case DATA_TYPE_INT16:
-                break;
-            case DATA_TYPE_INT32:
-                break;
-            case DATA_TYPE_C10:
-                break;
-            case DATA_TYPE_F16:
-                break;
-            case DATA_TYPE_F32:
-                break;
-            default:
-                printf("Invalid move data type\n");
-                bad_opcode = true;
-                continue;
+            static const uint32_t data_type_flag_table[] = { MOVE_TYPE_INT8, MOVE_TYPE_INT16, MOVE_TYPE_INT32, MOVE_TYPE_C10, MOVE_TYPE_F16, MOVE_TYPE_F32 };
+            if (data_type < sizeof data_type_flag_table / sizeof *data_type_flag_table) {
+                inst.flags = data_type_flag_table[data_type];
+            } else {
+                printf("Invalid vecmov data type!\n");
+                abort();
             }
 
             if (data_type == DATA_TYPE_C10 || data_type == DATA_TYPE_F16 || data_type == DATA_TYPE_F32) {
@@ -491,27 +670,62 @@ int main(int argc, char *argv[]) {
                 number_field_length = 6;
             }
 
-            printf("vmov.f32 ");
+            if (inst.op != OP_VMOV) {
+                for (int i = 0; i < 4; i++)
+                    reset_sgx543_register(reg[i]);
+
+                printf("unimplemented conditional moves!\n");
+                abort();
+            } else {
+                reset_sgx543_register(reg[0]);
+                reset_sgx543_register(reg[1]);
+            }
 
             int dest_num = (lower_part & ~0xFF03FFFFU) >> 18;
-            decode_dest_with_num(double_registers, upper_part, true, &dest_num, 7);
-            printf(".xyzw, ");
+            
+            reg[0].type = decode_dest_with_num(double_registers, upper_part, true, &dest_num, 7);
+            reg[0].num = dest_num;
+
+
+            hw_write_mask = (lower_part & ~0xF0FFFFFFU) >> 24;
+            if (data_type == DATA_TYPE_F32 || data_type == DATA_TYPE_F16) {
+                bool bf32;
+
+                bf32 = data_type == DATA_TYPE_F32;
+                inst.write_mask = decode_vec_destination_write_mask(reg[0].type, bf32, false, hw_write_mask);
+            } else {
+                inst.write_mask = hw_write_mask;
+            }
+  
+            // vecmov conditional
+
+            current_arg++;
 
             int src1_num = (lower_part & ~0xFFFFF03FU) >> 6;
+            reg[current_arg].type = decode_src12_with_num(true, upper_part, lower_part, 1, true, &src1_num, number_field_length, 0x00020000U);
+            reg[current_arg].num = src1_num;
 
-            decode_src12_with_num(true, upper_part, lower_part, 1, true, &src1_num, number_field_length, 0x00020000U);
-            printf(".xyzw\n");
+            current_arg++;
 
-            // TODO implement repeats
             repeat_count = ((upper_part & ~0xFFFFCFFFU) >> 12) + 1;
-
             for (int i = 0; i < repeat_count; i++) {
-                //int dest_repeat_offset = get_repeat_offset(USSERegType::REGTYPE_FPCONSTANT, i, 3);
-                int src1_repeat_offset = get_repeat_offset(USSERegType::REGTYPE_FPCONSTANT, i, 1);
-                printf("%d\n", src1_num + (src1_repeat_offset << 1));
+                int dest_repeat_offset = get_repeat_offset_moe(i, 3);
+                int src1_repeat_offset = get_repeat_offset_moe(i, 1);
+
+                if (inst.op == OP_VMOV) {
+                    reg[0].num = dest_num + dest_repeat_offset;
+                    reg[1].num = src1_num + src1_repeat_offset;
+
+                    inst.registers.push_back(reg[0]);
+                    inst.registers.push_back(reg[1]);
+                } else {
+                    printf("unimplemented vmovc!\n");
+                    abort();
+                }
+
+                add_usse_instruction(inst);
+                inst.registers.clear();
             }
-            printf("\n");
-            // bad_opcode = true;
             break;
         }
         case 8: // vecpck
@@ -608,10 +822,17 @@ int main(int argc, char *argv[]) {
                 },
             };
 
+            USSEInstruction inst;
+            SGX543Register reg[3];
+            reset_usse_instruction(inst);
+
+            for (int i = 0; i < 3; i++)
+                reset_sgx543_register(reg[i]);
+
             uint32_t dest_mask = (upper_part & ~0xFFFFFFC3U) >> 2;
             uint32_t dest_fmt = (upper_part & ~0xFFFFFE3FU) >> 6;
             uint32_t src_fmt = (upper_part & ~0xFFFFF1FFU) >> 9;
-            printf("vpck.f32f32 ");
+            uint32_t write_mask = (upper_part & ~0xFFFFFFC3U) >> 2;
 
             int repeat_count = (upper_part & ~0xFFFF0FFFU) >> 12;
             uint32_t channel;
@@ -623,29 +844,32 @@ int main(int argc, char *argv[]) {
 
             USSEOpcodeType opcode = fmt_ops[dest_fmt][src_fmt];
 
+            inst.op = opcode;
+            inst.write_mask = (int) write_mask;
             int dest_num = (lower_part & ~0xF01FFFFFU) >> 21;
-            decode_dest_with_num(false, upper_part, true, &dest_num, 7);
-            printf(".xyzw, ");
+
+            reg[0].type = decode_dest_with_num(false, upper_part, true, &dest_num, 7);
+            reg[0].num = dest_num;
+
+            inst.registers.push_back(reg[0]);
 
             swizzle_src = 2;
 
             if (src_fmt == 6 || src_fmt == 5 || src_fmt == 7) {
                 int src1_num = (lower_part & ~0xFFFFC0FFU) >> 8;
-                printf("(");
-                decode_src12_with_num(true, upper_part, lower_part, 1, true, &src1_num, 7, 0x00020000);
-                printf(".xyzw");
-            
+                reg[1].type = decode_src12_with_num(true, upper_part, lower_part, 1, true, &src1_num, 7, 0x00020000);
+                reg[1].num = src1_num;
+
+                inst.registers.push_back(reg[1]);
                 if (src_fmt == 6) {
                     int src2_num = (lower_part & ~0xFFFFFF81U) >> 1;
-                    printf(", ");
-                    decode_src12_with_num(true, upper_part, lower_part, 1, true, &src2_num, 7, 0x00020000);
-                    printf(".xyzw");
+                    reg[2].type = decode_src12_with_num(true, upper_part, lower_part, 1, true, &src2_num, 7, 0x00020000);
+                    reg[2].num = src2_num;
+                    inst.registers.push_back(reg[2]);
                 }
-                printf(")");
             }
 
-            // TODO implement repeated instructions
-            printf("\n");
+            usse_instruction_list.push_back(inst);
             break;
         }
         case 31: // special
@@ -658,8 +882,60 @@ int main(int argc, char *argv[]) {
                 break;
             case 1: // moectrl
             {
-                
-                printf("spec (moectrl)\n");
+                int ops[] = {
+                    OP_SMOA,
+                    OP_SMR,
+                    OP_SMLSI,
+                    OP_SMBO,
+                    OP_IMO,
+                    OP_SETFC
+                };
+
+                int opcode = ops[(upper_part & ~0xF8FFFFFFU) >> 24];
+
+                switch (opcode) {
+                case OP_SMLSI:
+                {
+                    USSEInstruction inst;
+
+                    reset_usse_instruction(inst);
+
+                    inst.op = OP_SMLSI;
+
+                    int dest_inc_mode = (upper_part >> 3) & 1;
+                    int src0_inc_mode = (upper_part >> 2) & 1, src1_inc_mode = (upper_part >> 1) & 1, src2_inc_mode = upper_part & 1;
+                    int dest_inc = (lower_part >> 24) & 0xFF, src0_inc = (lower_part >> 16) & 0xFF, src1_inc = (lower_part >> 8) & 0xFF, src2_inc = lower_part & 0xFF;
+                    auto parse_increment = [&](const int idx, const int inc_mode, const uint8_t inc_value) {
+                        if (inc_mode) {
+                            inst.ctrl_disasm += "swizz.(";
+
+                            // Parse value as swizzle
+                            for (int i = 0; i < 4; i++) {
+                                repeat_increase[idx][i] = ((inc_value >> (2 * i)) & 0b11);
+                                inst.ctrl_disasm += std::to_string(repeat_increase[idx][i]);
+                            }
+
+                            inst.ctrl_disasm += ") ";
+                        } else {
+                            // Parse value as immediate
+                            for (int i = 0; i < 17; i++) {
+                                repeat_increase[idx][i] = i * static_cast<std::int8_t>(inc_value);
+                            }
+
+                            inst.ctrl_disasm += "inc." + std::to_string(static_cast<std::int8_t>(inc_value)) + " ";
+                        }
+                    };
+
+                    parse_increment(3, dest_inc_mode, dest_inc);
+                    parse_increment(0, src0_inc_mode, src0_inc);
+                    parse_increment(1, src1_inc_mode, src1_inc);
+                    parse_increment(2, src2_inc_mode, src2_inc);
+                    break;
+                }
+                default:
+                    printf("unimplemented spec (moectrl opcode)\n");
+                    break;
+                }
                 break;
             }
             case 2: // other
@@ -675,6 +951,24 @@ int main(int argc, char *argv[]) {
             printf("Unknown opcode %d\n", common_opcode);
             bad_opcode = true;
             break;
+        }
+    }
+
+    for (auto& i : usse_instruction_list) {
+        if (i.op == OP_VPCKF32F32) {
+            printf("vpck.f32f32 ");
+            for (auto& j : i.registers) {
+                printf("%s%d.", get_register_operand_name(j.type), j.num);
+                for (int x = 0; x < 4; x++) {
+                    static const char mask_type[] = "xyzw";
+                    if (i.write_mask & (1 << x)) {
+                        printf("%c", mask_type[x]);
+                    }
+                }
+
+                printf(", ");
+            }
+            printf("\n");
         }
     }
     return 0;
