@@ -305,8 +305,8 @@ void perform_special_register_renaming(USSERegType& reg_bank, int *num) {
 }
 
 void perform_temp_register_renaming(bool double_registers, USSERegType& reg_bank, int *num, int num_field_length, int index_reg_num = 0) {
-	uint32_t num_temps_mapped;
-	uint32_t max_reg_num;
+    uint32_t num_temps_mapped;
+    uint32_t max_reg_num;
     int _num_value = *num;
 
     num_temps_mapped = 4;
