@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <vector>
 
+#include "shader_processor.h"
+
 enum USSEOpcodeType : int {
     // vecmov ops (lower 6 bits are reserved for move data type flags on USSEInstruction)
     OP_VMOV,
@@ -15,6 +17,28 @@ enum USSEOpcodeType : int {
     // vecmad ops
     OP_VF16MAD,
     OP_V4MAD,
+
+    // vecnmad ops (f32)
+
+    OP_VMUL,
+    OP_VADD,
+    OP_VFRC,
+    OP_VDSX,
+    OP_VDSY,
+    OP_VMIN,
+    OP_VMAX,
+    OP_VDP,
+
+    // vecnmad ops (f16)
+
+    OP_VF16MUL,
+    OP_VF16ADD,
+    OP_VF16FRC,
+    OP_VF16DSX,
+    OP_VF16DSY,
+    OP_VF16MIN,
+    OP_VF16MAX,
+    OP_VF16DP,
 
     // pck ops
     OP_VPCKU8U8,
@@ -186,42 +210,6 @@ const char *get_source_modifier_name(int index) {
     return source_modifier_name_table[index % 4];
 }
 
-const char *get_vecmad_source_swizzle_name(int src_num, int index) {
-	static const char *swizzle_table[3][8] = {
-        {
-            "xxxx",
-            "yyyy",
-            "zzzz",
-            "wwww",
-            "xyzw",
-            "yzxw",
-            "xyww",
-            "zwxy"
-        },
-        {
-            "xxxx",
-            "yyyy",
-            "zzzz",
-            "wwww",
-            "xyzw",
-            "xyyz",
-            "yyww",
-            "wyzw"
-        },
-        {
-            "xxxx",
-            "yyyy",
-            "zzzz",
-            "wwww",
-            "xyzw",
-            "xzww",
-            "xxyz",
-            "xyzz"
-        }
-    };
-    return swizzle_table[src_num][index];
-}
-
 struct SGX543Register {
     USSERegType type;
     int num;
@@ -249,6 +237,27 @@ void reset_sgx543_register(SGX543Register& reg) {
     reg.num = 0;
     reg.swizzle_index = 0;
     reg.flags = 0;
+}
+
+int get_write_mask_components_count(int write_mask) {
+    int count = 0;
+    for (int i = 0; i < 4; i++) {
+        if ((write_mask & (1 << i)) != 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+std::string get_write_mask_components(int write_mask) {
+    std::string p;
+    static const char mask[] = { 'x', 'y', 'z', 'w' };
+    for (int i = 0; i < 4; i++) {
+        if ((write_mask & (1 << i)) != 0) {
+            p += mask[i];
+        }
+    }
+    return p;
 }
 
 void set_repeat_multiplier(const int p0, const int p1, const int p2, const int p3) {
@@ -281,6 +290,27 @@ enum : int {
     SWIZZLE_SEL_HALF = (7),
     SWIZZLE_SEL_UNDEF = (8)
 };
+
+std::string get_swizzle_string(uint32_t idx) {
+    std::string x;
+
+    const char *str[] = { "x", "y", "z", "w", "0", "1", "2", "half" };
+    for (int i = 0; i < 4; i++)
+        x += str[(idx >> (3 * i)) & 7];
+    return x;
+}
+
+std::string get_swizzle_string_with_write_mask(uint32_t idx, int write_mask) {
+    std::string in = get_swizzle_string(idx);
+    std::string out;
+
+    for (int i = 0; i < 4; i++) {
+        if ((write_mask & (1 << i)) != 0) {
+            out += in[i];
+        }
+    }
+    return out;
+}
 
 #define SWIZZLE(XSEL, YSEL, ZSEL, WSEL) ((SWIZZLE_SEL_##XSEL << (3 * 0)) | \
                                         (SWIZZLE_SEL_##YSEL << (3 * 1)) | \
@@ -512,10 +542,10 @@ USSERegType decode_src12_bank(uint32_t upper_instruction, uint32_t lower_instruc
     default:
         [[fallthrough]];
     case 1:
-        bank_nr = (lower_instruction & ~0x3FFFFFFFU) >> 30;
+        bank_nr = (lower_instruction & ~0x3FFFFFFF) >> 30;
         break;
     case 2:
-        bank_nr = (lower_instruction & ~0xCFFFFFFFU) >> 28;
+        bank_nr = (lower_instruction & ~0xCFFFFFFF) >> 28;
         break;
     }
 
@@ -554,7 +584,7 @@ USSERegType decode_dest_with_num(bool double_registers, uint32_t upper_instructi
     bool extended_bank;
     USSERegType reg;
 
-    bank_nr = (upper_instruction & ~0xFFFFFFFCU);
+    bank_nr = (upper_instruction & ~0xFFFFFFFC);
     if (allow_extended && (upper_instruction & 0x00080000) == 0x00080000) {
         extended_bank = true;
     } else {
@@ -689,8 +719,8 @@ void decode_vec4mad_instruction(int upper_part, int lower_part) {
     inst.write_mask = 0;
 
     // decode dest register
-    dest_num = (lower_part & ~0xF03FFFFFU) >> 22;
-    hw_dest_mask = (upper_part & ~0xFFFFF87FU) >> 7;
+    dest_num = (lower_part & ~0xF03FFFFF) >> 22;
+    hw_dest_mask = (upper_part & ~0xFFFFF87F) >> 7;
 
     reg[0].type = decode_dest_with_num(true, upper_part, true, &dest_num, 7);
     reg[0].num = dest_num;
@@ -699,8 +729,8 @@ void decode_vec4mad_instruction(int upper_part, int lower_part) {
     inst.write_mask = decode_vec_destination_write_mask(reg[0].type, !is_f16, false, hw_dest_mask);
 
     // decode src0 register
-    src0_num = (lower_part & ~0xFFFC0FFFU) >> 12;
-    src0_swizzle = ((lower_part & ~0xFFF3FFFFU) >> 18) | ((upper_part & ~0xFFDFFFFFU) >> 21) << 2;
+    src0_num = (lower_part & ~0xFFFC0FFF) >> 12;
+    src0_swizzle = ((lower_part & ~0xFFF3FFFF) >> 18) | ((upper_part & ~0xFFDFFFFF) >> 21) << 2;
     reg[1].type = decode_src0_with_num(true, upper_part, false, &src0_num, 7, 0);
     reg[1].num = src0_num;
 
@@ -710,21 +740,140 @@ void decode_vec4mad_instruction(int upper_part, int lower_part) {
     reg[1].swizzle_index = auSrc0Swizzle[src0_swizzle];
 
     // decode src1 register
-    src1_num = (lower_part & ~0xFFFFF03FU) >> 6;
-    src1_swizzle = ((lower_part & ~0xFFCFFFFFU) >> 20) | ((upper_part & ~0xFFFFEFFFU) >> 12) << 2;
+    src1_num = (lower_part & ~0xFFFFF03F) >> 6;
+    src1_swizzle = ((lower_part & ~0xFFCFFFFF) >> 20) | ((upper_part & ~0xFFFFEFFF) >> 12) << 2;
     reg[2].type = decode_src12_with_num(true, upper_part, lower_part, 1, true, &src1_num, 7, 0x00020000);
     reg[2].num = src1_num;
-    reg[2].modifier = source_modifier_table[(upper_part & ~0xFFFFFF9FU) >> 5];
+    reg[2].modifier = source_modifier_table[(upper_part & ~0xFFFFFF9F) >> 5];
     reg[2].swizzle_index = auSrc1Swizzle[src1_swizzle];
 
-    src2_num = (lower_part & ~0xFFFFFFC0U);
-    src2_swizzle = ((upper_part & ~0xFFFF1FFFU) >> 13);
+    src2_num = (lower_part & ~0xFFFFFFC0);
+    src2_swizzle = ((upper_part & ~0xFFFF1FFF) >> 13);
     reg[3].type = decode_src12_with_num(true, upper_part, lower_part, 2, true, &src2_num, 7, 0x00010000);
     reg[3].num = src2_num;
-    reg[3].modifier = source_modifier_table[(upper_part & ~0xFFFFFFE7U) >> 3];
+    reg[3].modifier = source_modifier_table[(upper_part & ~0xFFFFFFE7) >> 3];
     reg[3].swizzle_index = auSrc2Swizzle[src2_swizzle];
 
     for (int i = 0; i < 4; i++)
+        inst.registers.push_back(reg[i]);
+    add_usse_instruction(inst);
+}
+
+int decode_vec4nmad_src1_swizzle(int lower_part, int upper_part) {
+    uint32_t hw_swizzle;
+    uint32_t chan;
+    int swizzle;
+
+	hw_swizzle =
+		((lower_part & ~0xFFC07FFF) >> 15) << 0;
+	hw_swizzle |=
+		((upper_part & ~0xFFFFFFF3) >> 2) << 7;
+	hw_swizzle |=
+		((upper_part & ~0xFFFBFFFF) >> 18) << 9;
+	hw_swizzle |=
+		((upper_part & ~0xFF9FFFFF) >> 21) << 10;
+
+    swizzle = 0;
+    for (chan = 0; chan < 4; chan++) {
+        uint32_t sel;
+        static const uint32_t swizzle_selector_table[] = {
+            SWIZZLE_SEL_X,
+            SWIZZLE_SEL_Y,
+            SWIZZLE_SEL_Z,
+            SWIZZLE_SEL_W,
+            SWIZZLE_SEL_0,
+            SWIZZLE_SEL_1,
+            SWIZZLE_SEL_2,
+            SWIZZLE_SEL_HALF
+        };
+
+        switch (chan) {
+        case 0: sel = (hw_swizzle & ~0xFF8) >> 0; break;
+        case 1: sel = (hw_swizzle & ~0xFC7) >> 3; break;
+        case 2: sel = (hw_swizzle & ~0xE3F) >> 6; break;
+        case 3: sel = (hw_swizzle & ~0x1FF) >> 9; break;
+        }
+
+        swizzle |= swizzle_selector_table[sel] << (3 * chan);
+    }
+    return swizzle;
+}
+
+void decode_vecnmad_instruction(int upper_part, int lower_part, bool bf16) {
+    USSEInstruction inst;
+    SGX543Register reg[3];
+
+    static const USSEOpcodeType decode_f16_table[] = {
+        OP_VF16MUL,
+        OP_VF16ADD,
+        OP_VF16FRC,
+        OP_VF16DSX,
+        OP_VF16DSY,
+        OP_VF16MIN,
+        OP_VF16MAX,
+        OP_VF16DP,
+    };
+
+    static const USSEOpcodeType decode_f32_table[] = {
+        OP_VMUL,
+        OP_VADD,
+        OP_VFRC,
+        OP_VDSX,
+        OP_VDSY,
+        OP_VMIN,
+        OP_VMAX,
+        OP_VDP,
+    };
+
+    static const uint32_t auSrc2Swizzle[] = {
+        SWIZZLE(X, X, X, X),
+        SWIZZLE(Y, Y, Y, Y),
+        SWIZZLE(Z, Z, Z, Z),
+        SWIZZLE(W, W, W, W),
+        SWIZZLE(X, Y, Z, W),
+        SWIZZLE(Y, Z, W, W),
+        SWIZZLE(X, Y, Z, Z),
+        SWIZZLE(X, X, Y, Z),
+        SWIZZLE(X, Y, X, Y),
+        SWIZZLE(X, Y, W, Z),
+        SWIZZLE(Z, X, Y, W),
+        SWIZZLE(Z, W, Z, W),
+        SWIZZLE(Y, Z, X, Z),
+        SWIZZLE(X, X, Y, Y),
+        SWIZZLE(X, Z, W, W),
+        SWIZZLE(X, Y, Z, 1),
+    };
+
+    int dest_num, src1_num, src2_num;
+    int src1_modifier, src1_swizzle, src2_swizzle;
+    int write_mask;
+
+    reset_usse_instruction(inst);
+    for (int i = 0; i < 3; i++)
+        reset_sgx543_register(reg[i]);
+
+    int opcode = (lower_part & ~0xFFFF8FFF) >> 12;
+    inst.op = bf16 ? decode_f16_table[opcode] : decode_f32_table[opcode];
+    inst.write_mask = (upper_part & ~0xFFFFF87F) >> 7;
+    dest_num = (lower_part & ~0xF03FFFFF) >> 22;
+
+    reg[0].type = decode_dest_with_num(true, upper_part, true, &dest_num, 7);
+    reg[0].num = dest_num;
+
+    src1_num = (lower_part & ~0xFFFFF03F) >> 6;
+    reg[1].type = decode_src12_with_num(true, upper_part, lower_part, 1, true, &src1_num, 7, 0x00020000);
+    reg[1].num = src1_num;
+    reg[1].modifier = source_modifier_table[(upper_part & ~0xFFFFFF9FU) >> 5];
+    reg[1].swizzle_index = decode_vec4nmad_src1_swizzle(lower_part, upper_part);
+
+    src2_num = (lower_part & ~0xFFFFFFC0U);
+    reg[2].type = decode_src12_with_num(true, upper_part, lower_part, 2, true, &src2_num, 7, 0x10000);
+    reg[2].num = src2_num;
+    if (upper_part & 0x10)
+        reg[2].modifier = SOURCE_MODIFIER_ABS;
+        reg[2].swizzle_index = auSrc2Swizzle[(upper_part & ~0xFFFF0FFFU) >> 12];
+
+    for (int i = 0; i < 3; i++)
         inst.registers.push_back(reg[i]);
     add_usse_instruction(inst);
 }
@@ -735,7 +884,7 @@ void decode_vecmov_instruction(int upper_part, int lower_part) {
 
     static const USSEOpcodeType move_op_table[] = { OP_VMOV, OP_VMOVC, OP_VMOVCU8, OP_UNDEF };
     int hw_write_mask;
-    int move_type = (upper_part & ~0xFFFF3FFFU) >> 14;
+    int move_type = (upper_part & ~0xFFFF3FFF) >> 14;
     int data_type;
     bool double_registers;
     int number_field_length;
@@ -746,7 +895,7 @@ void decode_vecmov_instruction(int upper_part, int lower_part) {
 
     inst.op = move_op_table[move_type];
 
-    data_type = (upper_part & ~0xFFFFF8FFU) >> 8;
+    data_type = (upper_part & ~0xFFFFF8FF) >> 8;
     static const uint32_t data_type_flag_table[] = { MOVE_TYPE_INT8, MOVE_TYPE_INT16, MOVE_TYPE_INT32, MOVE_TYPE_C10, MOVE_TYPE_F16, MOVE_TYPE_F32 };
     if (data_type < sizeof data_type_flag_table / sizeof *data_type_flag_table) {
         inst.flags = data_type_flag_table[data_type];
@@ -774,13 +923,13 @@ void decode_vecmov_instruction(int upper_part, int lower_part) {
         reset_sgx543_register(reg[1]);
     }
 
-    int dest_num = (lower_part & ~0xFF03FFFFU) >> 18;
+    int dest_num = (lower_part & ~0xFF03FFFF) >> 18;
     
     reg[0].type = decode_dest_with_num(double_registers, upper_part, true, &dest_num, 7);
     reg[0].num = dest_num;
 
 
-    hw_write_mask = (lower_part & ~0xF0FFFFFFU) >> 24;
+    hw_write_mask = (lower_part & ~0xF0FFFFFF) >> 24;
     if (data_type == DATA_TYPE_F32 || data_type == DATA_TYPE_F16) {
         bool bf32;
 
@@ -794,13 +943,13 @@ void decode_vecmov_instruction(int upper_part, int lower_part) {
 
     current_arg++;
 
-    int src1_num = (lower_part & ~0xFFFFF03FU) >> 6;
+    int src1_num = (lower_part & ~0xFFFFF03F) >> 6;
     reg[current_arg].type = decode_src12_with_num(true, upper_part, lower_part, 1, true, &src1_num, number_field_length, 0x00020000U);
     reg[current_arg].num = src1_num;
 
     current_arg++;
 
-    repeat_count = ((upper_part & ~0xFFFFCFFFU) >> 12) + 1;
+    repeat_count = ((upper_part & ~0xFFFFCFFF) >> 12) + 1;
     for (int i = 0; i < repeat_count; i++) {
         int dest_repeat_offset = get_repeat_offset_moe(i, 3);
         int src1_repeat_offset = get_repeat_offset_moe(i, 1);
@@ -826,19 +975,11 @@ int main(int argc, char *argv[]) {
     reset_repeat_multiplier();
 
     uint64_t instructions[] = {
-        0x00a2818661004306ull, // vmad
-        0x00a2818661405307ull, // vmad
-        0xf804014000000000ull, // nop
-        0xfa44070000000000ull, // phase
-        0xfa10000201010e01ull, // smlsi
-        0x3880252183080080ull, // vmov
-        0xfa14000001010101ull, // smlsi
-        0x38800d2083f00000ull, // vmov
-        0x40c00dbcffb9840aull, // pck
-        0x18b18f80cf451102ull, // vmad
-        0x18b18181c0011100ull, // vmad
-        0x18b18181c042d101ull, // vmad
-        0xfb275000a0200000ull, // spec
+        0xfa44070000000000,//: PHAS
+        0xf800094000000000,//: NOP
+        0x40c00dbcaf998002,//: VPCKF32F32 i0.xyzw (pa0.xyzw pa2.xyzw) [noscale]
+        0x40800dbcafb98206,//: VPCKF32F32 i1.xyzw (pa4.xyzw pa6.xyzw) [noscale]
+        0x10a4478600040f7c,//: VF16MUL pa0.xyzw i1.xyzw i0.xyzw
     };
 
     uint64_t instructions2[] = {
@@ -859,10 +1000,10 @@ int main(int argc, char *argv[]) {
 
     bool bad_opcode = false;
 
-    secondary_program_state = true;
+    secondary_program_state = false;
     int count = 0;
 
-    for (auto& instruction : instructions2) {
+    for (auto& instruction : instructions) {
         int common_opcode;
         
         if (bad_opcode)
@@ -879,6 +1020,16 @@ int main(int argc, char *argv[]) {
         case 0: // vec4mad
         {
             decode_vec4mad_instruction(upper_part, lower_part);
+            break;
+        }
+        case 1: // vecnmadf32
+        {
+            decode_vecnmad_instruction(upper_part, lower_part, false);
+            break;
+        }
+        case 2: // vecnmadf16
+        {
+            decode_vecnmad_instruction(upper_part, lower_part, true);
             break;
         }
         case 3: // svec
@@ -1218,22 +1369,417 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    for (auto& i : usse_instruction_list) {
-        if (i.op == OP_VMAD4) {
-            printf("vpck.f32f32 ");
-            for (auto& j : i.registers) {
-                printf("%s%d.", get_register_operand_name(j.type), j.num);
-                for (int x = 0; x < 4; x++) {
-                    static const char mask_type[] = "xyzw";
-                    if (i.write_mask & (1 << x)) {
-                        printf("%c", mask_type[x]);
-                    }
-                }
+    if (bad_opcode)
+        return -1;
 
-                printf(", ");
+    ShaderProcessor processor;
+    processor.set_shader_version("430");
+    processor.set_function_target("null");
+
+    processor.add_variable("vec4", "o[20]");
+    processor.add_variable("vec4", "pa[32]");
+    processor.add_variable("vec4", "sa[32]");
+    processor.add_variable("vec4", "i[4]");
+    processor.add_line("");
+    processor.create_function("main");
+    processor.set_function_target("main");
+
+    static bool defined_pack_function;
+    defined_pack_function = false;
+    static int temp_reg;
+
+    temp_reg = 0;
+    for (auto& i : usse_instruction_list) {
+        switch (i.op) {
+        case OP_VMOV: // vmov
+        {
+            std::string x;
+            int write_mask;
+            std::string write_mask_str;
+            std::string swizzle;
+            int reg_dest, reg_src1;
+            std::string final_output_register;
+
+            if (i.registers[0].type != REGTYPE_FPINTERNAL) {
+                reg_dest = i.registers[0].num >> 2;
+                write_mask = (i.write_mask << (i.registers[0].num % 4)) & 0xF;
+            } else {
+                reg_dest = i.registers[0].num;
+                write_mask = i.write_mask;
             }
-            printf("\n");
+
+            x += std::string(get_register_operand_name(i.registers[0].type)) + ("[" + std::to_string(reg_dest) + "].") + get_write_mask_components(write_mask) + " = ";
+
+            if (!(i.registers[1].type == REGTYPE_FPINTERNAL || i.registers[1].type == REGTYPE_FPCONSTANT)) {
+                reg_src1 = i.registers[1].num >> 2;
+                write_mask = (i.write_mask << (i.registers[1].num % 4)) & 0xF;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[1].swizzle_index, write_mask);
+                x += get_register_operand_name(i.registers[1].type) +  ("[" + std::to_string(reg_src1) + "].") + get_write_mask_components(write_mask) + ";";
+            } else {
+                reg_src1 = i.registers[1].num;
+                write_mask = i.write_mask;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[1].swizzle_index, write_mask);
+
+                if (i.registers[1].type == REGTYPE_FPCONSTANT) {
+                    if (i.registers[1].num == 1 && get_write_mask_components_count(write_mask) == 1)
+                        x += "1.0;";
+                } else {
+                    x += get_register_operand_name(i.registers[1].type) +  ("[" + std::to_string(reg_src1) + "].") + get_write_mask_components(write_mask) + ";";
+                }
+            }
+
+            processor.add_line(x);
+            break;
+        }
+        case OP_V4MAD: // v4mad
+        {
+            std::string x;
+            std::string write_mask_str;
+            int reg_dest, reg_src0, reg_src1, reg_src2;
+            int write_mask;
+            std::string swizzle;
+
+            (void) reg_src1;
+
+            if (i.registers[0].type != REGTYPE_FPINTERNAL) {
+                reg_dest = i.registers[0].num >> 2;
+                write_mask = (i.write_mask << (i.registers[0].num % 4)) & 0xF;
+            } else {
+                reg_dest = i.registers[0].num;
+                write_mask = i.write_mask;
+            }
+
+            x += std::string(get_register_operand_name(i.registers[0].type)) + ("[" + std::to_string(reg_dest) + "].") + get_write_mask_components(write_mask) + " = ";
+            x += "(";
+
+            if (!(i.registers[1].type == REGTYPE_FPINTERNAL || i.registers[1].type == REGTYPE_FPCONSTANT)) {
+                reg_src0 = i.registers[1].num >> 2;
+                write_mask = (i.write_mask << (i.registers[1].num % 4)) & 0xF;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[1].swizzle_index, write_mask);
+            } else {
+                reg_src0 = i.registers[1].num;
+                write_mask = i.write_mask;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[1].swizzle_index, write_mask);
+            }
+
+            x += std::string(get_register_operand_name(i.registers[1].type)) +  ("[" + std::to_string(reg_src0) + "].") + swizzle;
+
+            x += " * ";
+
+            if (!(i.registers[2].type == REGTYPE_FPINTERNAL || i.registers[2].type == REGTYPE_FPCONSTANT)) {
+                reg_src1 = i.registers[2].num >> 2;
+                write_mask = (i.write_mask << (i.registers[2].num % 4)) & 0xF;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[2].swizzle_index, write_mask);
+            } else {
+                reg_src1 = i.registers[1].num;
+                write_mask = i.write_mask;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[2].swizzle_index, write_mask);
+            }
+
+            if (i.registers[2].type == REGTYPE_FPCONSTANT) {
+                int num_comps = get_write_mask_components_count(write_mask);
+
+                if (i.registers[2].num == 12 && num_comps == 2)
+                    x += "vec2(0.5)";
+                else {
+                    printf("Bad v4mad fpconstant\n");
+                    std::exit(0);
+                }
+            } else {
+                printf("bad v4mad\n");
+                std::exit(0);
+            }
+
+            x += ") + ";
+
+            if (!(i.registers[3].type == REGTYPE_FPINTERNAL || i.registers[3].type == REGTYPE_FPCONSTANT)) {
+                reg_src2 = i.registers[3].num >> 2;
+                write_mask = (i.write_mask << (i.registers[3].num % 4)) & 0xF;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[3].swizzle_index, write_mask);
+            } else {
+                reg_src2 = i.registers[3].num;
+                write_mask = i.write_mask;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[3].swizzle_index, write_mask);
+            }
+
+            x += std::string(get_register_operand_name(i.registers[1].type)) +  ("[" + std::to_string(reg_src2) + "].") + swizzle;
+
+            x += ";";
+            processor.add_line(x);
+            break;
+        }
+        case OP_VMUL:
+        {
+            std::string x;
+            int write_mask;
+            std::string write_mask_str;
+            std::string swizzle;
+            int reg_dest, reg_src1, reg_src2;
+
+            if (i.registers[0].type != REGTYPE_FPINTERNAL) {
+                reg_dest = i.registers[0].num >> 2;
+                write_mask = (i.write_mask << (i.registers[0].num % 4)) & 0xF;
+            } else {
+                reg_dest = i.registers[0].num;
+                write_mask = i.write_mask;
+            }
+
+            x += std::string(get_register_operand_name(i.registers[0].type)) + ("[" + std::to_string(reg_dest) + "].") + get_write_mask_components(write_mask) + " = ";
+
+            if (i.registers[1].type == REGTYPE_IMMEDIATE) {
+                reg_src1 = i.registers[1].num;
+                write_mask = i.write_mask;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[1].swizzle_index, write_mask);
+            
+                x += "vec2(";
+                x.push_back(swizzle[0]);
+                x += ".0, ";
+                x.push_back(swizzle[1]);
+                x += ".0)";
+            } else if (!(i.registers[1].type == REGTYPE_FPINTERNAL || i.registers[1].type == REGTYPE_FPCONSTANT)) {
+                reg_src1 = i.registers[1].num >> 2;
+                write_mask = (i.write_mask << (i.registers[1].num % 4)) & 0xF;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[1].swizzle_index, write_mask);
+                x += std::string(get_register_operand_name(i.registers[1].type)) +  ("[" + std::to_string(reg_src1) + "].") + get_write_mask_components(write_mask);
+            } else {
+                reg_src1 = i.registers[1].num;
+                write_mask = i.write_mask;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[1].swizzle_index, write_mask);
+                x += std::string(get_register_operand_name(i.registers[1].type)) +  ("[" + std::to_string(reg_src1) + "].") + get_write_mask_components(write_mask);
+            }
+
+            if (!(i.registers[2].type == REGTYPE_FPINTERNAL || i.registers[2].type == REGTYPE_FPCONSTANT)) {
+                reg_src2 = i.registers[2].num >> 2;
+                write_mask = (i.write_mask << (i.registers[2].num % 4)) & 0xF;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[2].swizzle_index, write_mask);
+            } else {
+                reg_src2 = i.registers[2].num;
+                write_mask = i.write_mask;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[2].swizzle_index, write_mask);
+            }
+
+            x += " * ";
+
+            if (i.registers[2].type == REGTYPE_FPCONSTANT) {
+                if (reg_src2 == 1) {
+                    x += "vec2(1.0)." + swizzle;
+                } else {
+                    printf("unimplemented fpconstant %d\n", reg_src2);
+                    std::exit(0);
+                }
+            } else {
+                x += std::string(get_register_operand_name(i.registers[2].type)) +  ("[" + std::to_string(reg_src2) + "].") + get_write_mask_components(write_mask);
+            }
+            x += ";";
+
+            processor.add_line(x);
+            break;
+        }
+        case OP_VF16MUL:
+        {
+            std::string x;
+            int write_mask;
+            std::string write_mask_str;
+            std::string swizzle;
+            int reg_dest, reg_src1, reg_src2;
+
+            if (!defined_pack_function) {
+                processor.create_function("pack2xF16");
+                processor.set_function_target("pack2xF16");
+                processor.set_function_parameters("vec2 x");
+                processor.set_function_return_type("float");
+                processor.add_line("return uintBitsToFloat(packHalf2x16(x));");
+                processor.finalize_function("pack2xF16");
+                processor.set_function_target("main");
+                defined_pack_function = true;
+            }
+
+            if (i.registers[0].type != REGTYPE_FPINTERNAL) {
+                reg_dest = i.registers[0].num >> 2;
+                write_mask = (i.write_mask << (i.registers[0].num % 4)) & 0xF;
+            } else {
+                reg_dest = i.registers[0].num;
+                write_mask = i.write_mask;
+            }
+
+
+            x += "vec4 temp" + std::to_string(temp_reg) + " = ";
+
+            if (!(i.registers[1].type == REGTYPE_FPINTERNAL || i.registers[1].type == REGTYPE_FPCONSTANT)) {
+                reg_src1 = i.registers[1].num >> 2;
+                write_mask = (i.write_mask << (i.registers[1].num % 4)) & 0xF;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[1].swizzle_index, write_mask);
+                x += std::string(get_register_operand_name(i.registers[1].type)) +  ("[" + std::to_string(reg_src1) + "].") + get_write_mask_components(write_mask);
+            } else {
+                reg_src1 = i.registers[1].num;
+                write_mask = i.write_mask;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[1].swizzle_index, write_mask);
+                x += std::string(get_register_operand_name(i.registers[1].type)) +  ("[" + std::to_string(reg_src1) + "].") + get_write_mask_components(write_mask);
+            }
+
+            if (!(i.registers[2].type == REGTYPE_FPINTERNAL || i.registers[2].type == REGTYPE_FPCONSTANT)) {
+                reg_src2 = i.registers[2].num >> 2;
+                write_mask = (i.write_mask << (i.registers[2].num % 4)) & 0xF;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[2].swizzle_index, write_mask);
+            } else {
+                reg_src2 = i.registers[2].num;
+                write_mask = i.write_mask;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[2].swizzle_index, write_mask);
+            }
+
+            x += " * ";
+
+            if (i.registers[2].type == REGTYPE_FPCONSTANT) {
+                if (reg_src2 == 1) {
+                    x += "vec2(1.0)." + swizzle;
+                } else {
+                    printf("unimplemented fpconstant %d\n", reg_src2);
+                    std::exit(0);
+                }
+            } else {
+                x += std::string(get_register_operand_name(i.registers[2].type)) +  ("[" + std::to_string(reg_src2) + "].") + get_write_mask_components(write_mask);
+            }
+            x += ";\n";
+
+            x += "    " + std::string(get_register_operand_name(i.registers[0].type)) + ("[" + std::to_string(reg_dest) + "].") + get_write_mask_components(write_mask & 3) + " = ";
+            x += ("vec2(pack2xF16(temp" + std::to_string(temp_reg) + ".xy), ") + "pack2xF16(temp" + std::to_string(temp_reg) + ".zw)" ");";
+            temp_reg++;
+
+            processor.add_line(x);
+            break;
+        }
+        case OP_VPCKF32F32: // vpck.f32f32
+        {
+            std::string x;
+            int write_mask;
+            std::string write_mask_str;
+            std::string swizzle;
+            int reg_dest, reg_src1, reg_src2;
+
+            if (i.registers[0].type != REGTYPE_FPINTERNAL) {
+                reg_dest = i.registers[0].num >> 2;
+                write_mask = (i.write_mask << (i.registers[0].num % 4)) & 0xF;
+            } else {
+                reg_dest = i.registers[0].num;
+                write_mask = i.write_mask;
+            }
+
+            x += std::string(get_register_operand_name(i.registers[0].type)) + ("[" + std::to_string(reg_dest) + "].") + get_write_mask_components(write_mask) + " = ";
+
+            if (!(i.registers[1].type == REGTYPE_FPINTERNAL || i.registers[1].type == REGTYPE_FPCONSTANT)) {
+                reg_src1 = i.registers[1].num >> 2;
+                write_mask = (i.write_mask << (i.registers[1].num % 4)) & 0xF;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[1].swizzle_index, write_mask);
+            } else {
+                reg_src1 = i.registers[1].num;
+                write_mask = i.write_mask;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[1].swizzle_index, write_mask);
+            }
+
+            x += "vec4(";
+
+            x += std::string(get_register_operand_name(i.registers[1].type)) +  ("[" + std::to_string(reg_src1) + "].") + get_write_mask_components(write_mask);
+
+            if (!(i.registers[2].type == REGTYPE_FPINTERNAL || i.registers[2].type == REGTYPE_FPCONSTANT)) {
+                reg_src2 = i.registers[2].num >> 2;
+                write_mask = (i.write_mask << (i.registers[2].num % 4)) & 0xF;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[2].swizzle_index, write_mask);
+            } else {
+                reg_src2 = i.registers[2].num;
+                write_mask = i.write_mask;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[2].swizzle_index, write_mask);
+            }
+
+            x += ", ";
+
+            x += std::string(get_register_operand_name(i.registers[2].type)) +  ("[" + std::to_string(reg_src2) + "].") + get_write_mask_components(write_mask);
+            x += ");";
+
+            processor.add_line(x);
+            break;
+        }
+        case OP_VMAD4: // vmad4
+        {
+            std::string x;
+            std::string write_mask_str;
+            int reg_dest, reg_src0, reg_src1, reg_src2;
+            int write_mask;
+            std::string swizzle;
+
+            (void) reg_src1;
+
+            if (i.registers[0].type != REGTYPE_FPINTERNAL) {
+                reg_dest = i.registers[0].num >> 2;
+                write_mask = (i.write_mask << (i.registers[0].num % 4)) & 0xF;
+            } else {
+                reg_dest = i.registers[0].num;
+                write_mask = i.write_mask;
+            }
+
+            x += std::string(get_register_operand_name(i.registers[0].type)) + ("[" + std::to_string(reg_dest) + "].") + get_write_mask_components(write_mask) + " = ";
+            x += "(";
+
+            if (!(i.registers[1].type == REGTYPE_FPINTERNAL || i.registers[1].type == REGTYPE_FPCONSTANT)) {
+                reg_src0 = i.registers[1].num >> 2;
+                write_mask = (i.write_mask << (i.registers[1].num % 4)) & 0xF;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[1].swizzle_index, write_mask);
+            } else {
+                reg_src0 = i.registers[1].num;
+                write_mask = i.write_mask;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[1].swizzle_index, write_mask);
+            }
+
+            x += std::string(get_register_operand_name(i.registers[1].type)) +  ("[" + std::to_string(reg_src0) + "].") + swizzle;
+
+            x += " * ";
+
+            if (!(i.registers[2].type == REGTYPE_FPINTERNAL || i.registers[2].type == REGTYPE_FPCONSTANT)) {
+                reg_src1 = i.registers[2].num >> 2;
+                write_mask = (i.write_mask << (i.registers[2].num % 4)) & 0xF;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[2].swizzle_index, write_mask);
+            } else {
+                reg_src1 = i.registers[1].num;
+                write_mask = i.write_mask;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[2].swizzle_index, write_mask);
+            }
+
+            if (i.registers[2].type == REGTYPE_FPCONSTANT) {
+                int num_comps = get_write_mask_components_count(write_mask);
+
+                if (i.registers[2].num == 12 && num_comps == 2)
+                    x += "vec2(0.5)";
+                else {
+                    printf("Bad v4mad fpconstant\n");
+                    std::exit(0);
+                }
+            } else {
+                x += std::string(get_register_operand_name(i.registers[2].type)) +  ("[" + std::to_string(reg_src1) + "].") + swizzle;
+            }
+
+            x += ") + ";
+
+            if (!(i.registers[3].type == REGTYPE_FPINTERNAL || i.registers[3].type == REGTYPE_FPCONSTANT)) {
+                reg_src2 = i.registers[3].num >> 2;
+                write_mask = (i.write_mask << (i.registers[3].num % 4)) & 0xF;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[3].swizzle_index, write_mask);
+            } else {
+                reg_src2 = i.registers[3].num;
+                write_mask = i.write_mask;
+                swizzle = get_swizzle_string_with_write_mask(i.registers[3].swizzle_index, write_mask);
+            }
+
+            x += std::string(get_register_operand_name(i.registers[1].type)) +  ("[" + std::to_string(reg_src2) + "].") + swizzle;
+
+            x += ";";
+            processor.add_line(x);
+            break;
+        }
+        default:
+            printf("unimplemented op %d\n", i.op);
         }
     }
+
+    processor.finalize_function("main");
+    printf("%s\n", processor.get_shader_code());
     return 0;
 }
