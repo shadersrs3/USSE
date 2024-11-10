@@ -8,8 +8,9 @@ set(CMAKE_CXX_COMPILER "/usr/bin/clang++")
 
 add_compile_options(-Wall -fjump-tables -O3)
 
-set(SOURCE_FILES src/main.cpp src/shader_processor.cpp)
+set(SOURCE_FILES src/main.cpp src/shader_processor.cpp src/shader_types.cpp src/shader_recompiler.cpp src/shader_decoder.cpp)
 
+include_directories(SYSTEM src/)
 add_executable(${PROJECT_NAME} ${SOURCE_FILES} ${HEADER_FILES})
 
 target_link_libraries(${PROJECT_NAME}
